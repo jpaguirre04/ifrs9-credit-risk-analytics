@@ -14,7 +14,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
-
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_curve
+from scipy.stats import ks_2samp
+from scipy.optimize import minimize_scalar
 
 # =============================================================================
 # PASO 1: CARGA DE DATOS Y DEFINICIÓN DEL TARGET
@@ -65,12 +69,22 @@ else:
         df['loan_int_rate'] = df['loan_int_rate'].astype(float)
 
 
+# imputar valores faltantes missing values con mediana, se imputa 
+# con la mediana por grado 
+
+df['loan_int_rate'] = df.groupby('loan_grade')['loan_int_rate'].transform(
+       lambda x: x.fillna(x.median())
+    )
+
+ 
 # B. Antigüedad laboral (person_emp_length) a valor numérico
-# Rellenamos nulos con 0 o la mediana (en IFRS 9 el tratamiento 
+# Rellenamos nulos con la mediana (en IFRS 9 el tratamiento 
 # de NAs es crítico)
 
+
+
 df['emp_length_years']=(
-    df['person_emp_length'].fillna(0).astype(float)
+    df['person_emp_length'].fillna(df['person_emp_length'].median())
 )
 
 
@@ -86,7 +100,6 @@ grade_map = {grade: idx + 1 for idx, grade in enumerate(grades)}
 df['grade_num'] = df['loan_grade'].map(grade_map)
 
 
-
 # D. Tratamiento de Categorías Previas de Buró (cb_person_default_on_file)
 # Mapeo binario: Y=1, N=0
 
@@ -94,10 +107,18 @@ df['historical_default_flag'] = (
       df['cb_person_default_on_file'].map({'Y': 1, 'N': 0}).fillna(0)
     )
 
+# E. Como person_home_ownership y loan_intent son textos aun, hay que 
+# convertirlas a números 
+
+df.columns
+
+df = pd.get_dummies(df, columns=['person_home_ownership', 'loan_intent'], 
+                    drop_first= True, dtype= int)
 
 
 # =============================================================================
 # PASO 2: ESTIMACIÓN DE PD 12M TTC CON REGRESIÓN LOGÍSTICA (ENFOQUE DIRECTO)
+# Y VALIDACIÓN
 # =============================================================================
 
 # TTC significa Through-The-Cycle (A través del ciclo).
@@ -107,56 +128,45 @@ df['historical_default_flag'] = (
 
 features = ['cb_person_cred_hist_length', 'loan_percent_income',
             'emp_length_years', 'person_income', 'loan_amnt',
-            'loan_int_rate', 'grade_num',]
+            'loan_int_rate', 'grade_num',  'historical_default_flag',
+            'person_home_ownership_OTHER', 'person_home_ownership_OWN',
+            'person_home_ownership_RENT', 'loan_intent_EDUCATION',
+            'loan_intent_HOMEIMPROVEMENT', 'loan_intent_MEDICAL',
+            'loan_intent_PERSONAL', 'loan_intent_VENTURE']
 
 X = df[features].fillna(df[features].median())
 y = df['target_default']
 
-# 2. Ajuste del modelo de Regresión Logística sobre toda la muestra
-modelo = LogisticRegression(max_iter =1000)
-modelo.fit(X, y)
 
-# 3. Cálculo e incorporación de la Probabilidad de Default TTC (12 Meses)
+# 2.- EL SPLIT, para validar de verdad
 
 
-# 6. Guardar la PD predicha en el dataframe principal
-df['pd_12m_ttc'] =  modelo.predict_proba(X)[:,1]
+X_train, X_test, y_train, y_test = train_test_split(X, y,
+                                                    test_size= 0.30,
+                                                    random_state = 42,
+                                                    stratify = y)
 
+# 3.- Pipeline con scaler + modelo
 
-# =============================================================================
-# PASO 2B: VALIDACIÓN DISCRIMINATORIA (AUC, KS, GINI)
-# =============================================================================
-
-from sklearn.metrics import roc_curve
-from scipy.stats import ks_2samp
-
-# 1. Split 70/30 estratificado
-X_train, X_test, y_train, y_test = train_test_split(X, y, 
-                                                    test_size=0.30, 
-                                                    random_state= 42,
-                                                    stratify=y)
-modelo = LogisticRegression(max_iter= 1000)
+modelo = Pipeline([
+         ('scaler', StandardScaler()),    
+         ('logreg', LogisticRegression(max_iter=1000))
+    ])
 modelo.fit(X_train, y_train)
 
-# Probabilidades
-y_pred_test  = modelo.predict_proba(X_test)[:, 1]
+y_pred_test = modelo.predict_proba(X_test)[:, 1]
 
-# Cálculo métricas de validación:
-
-# A. ROC AUC
 roc_auc = roc_auc_score(y_test, y_pred_test)
-
-#B. coeficiente de gini
-gini = (2 * roc_auc) - 1
+gini = (2 * roc_auc) - 1 
 
 # C. Kolmogorov-Smirnov (KS)
 # Separamos las probabilidades predichas para los Buenos (0) y Malos (1)
 
+
+# Calculamos el estadístico KS entre ambas distribuciones
 proba_buenos = y_pred_test[y_test == 0]
 proba_malos = y_pred_test[y_test == 1]
 
-
-# Calculamos el estadístico KS entre ambas distribuciones
 ks_stat, _ = ks_2samp(proba_buenos, proba_malos)
 
 
@@ -171,46 +181,59 @@ print(f"Gini Index : {gini:.4f} ({gini*100:.2f}%)")
 print(f"KS Statistic: {ks_stat:.4f} ({ks_stat*100:.2f}%)")
 print("=" * 45)
 
+# 4. Re-entreno con toda la muestra para la PD final
+
+modelo_final = Pipeline([
+    ('scaler', StandardScaler()),
+    ('logreg', LogisticRegression(max_iter= 1000))
+    ])
+
+modelo_final.fit(X, y)
+
+
+# 5. Guardar la PD predicha en el dataframe principal
+df['pd_12m_ttc'] =  modelo_final.predict_proba(X)[:,1]
+
 
 
 
 # =============================================================================
 # PASO 3: CALIBRACIÓN IFRS 9 - ESTÁNDAR BANCARIO (INTERCEPT SHIFTING)
 # =============================================================================
-# Definir la Tasa de Largo Plazo (LRA) histórica de la cartera 
-# (Ejemplo: 0.045 para 4.5%, o reemplazar por el ODR histórico real)
+# Objetivo: Ajustar el nivel promedio de la PD para que coincida
+# con la Tasa de Default Observada (ODR) de largo plazo de la cartera,
+# sin alterar la capacidad de discriminación del modelo (AUC).
 
-# En lugar de un valor fijo (0.045), calculas el ODR histórico real de tu base de datos
-# (idealmente filtrando por la cohorte o ventana temporal de ciclo completo)
+# Usamos modelo_final, entrenado con el 100% de la muestra.
+# TARGET_LRA = ODR histórico de la cartera (en este dataset: 21.7%).
+# En un banco, este valor vendría de la serie histórica de ciclo completo.
+logreg_final = modelo_final.named_steps['logreg']
+scaler_final = modelo_final.named_steps['scaler']
 
-TARGET_LRA = df['target_default'].mean() # O la media de tu periodo histórico de largo plazo
-# TARGET_LRA = 0.045
+# TARGET_LRA = 0.045 # Tu LRA de largo plazo, no la media de este año
+TARGET_LRA = df['target_default'].mean() # te va a dar como 0.217
 
-coefs = modelo.coef_[0]
-intercepto_original = modelo.intercept_[0]
-linear_combination = np.dot(X, coefs)
 
-# Función objetivo para alinear exactamente la media predicha con el LRA
+
+# Hay que escalar X antes de hacer el dot, porque el modelo lo hace así
+X_scaled = scaler_final.transform(X)
+coefs = logreg_final.coef_[0]
+intercepto_original = logreg_final.intercept_[0]
+linear_combination = np.dot(X_scaled, coefs)
+
+
 def funcion_costo(delta_intercept):
     logit = linear_combination + intercepto_original + delta_intercept
-    pd_pred = 1 / (1+ np.exp(-logit))
-    # print(pd_pred)
+    pd_pred = 1 / (1 + np.exp(-logit))
     return (pd_pred.mean() - TARGET_LRA) ** 2
 
-
-from scipy.optimize import minimize_scalar
-from sklearn.calibration import calibration_curve
-# Optimización numérica del intercepto
-resultado =  minimize_scalar(funcion_costo)
+resultado = minimize_scalar(funcion_costo)
 delta_optimo = resultado.x
 
+# Aplicar al modelo final
+logreg_final.intercept_[0] += delta_optimo
 
-# Aplicar el nuevo intercepto al modelo
-modelo.intercept_[0] += delta_optimo
-
-
-# Generar la PD 12M TTC Calibrada final
-df['pd_12m_calibrated'] = modelo.predict_proba(X)[:, 1]
+df['pd_12m_calibrated'] = modelo_final.predict_proba(X)[:, 1]
 
 
 print(f"AUC del Modelo (Inalterado): {roc_auc_score(y, df['pd_12m_calibrated']):.4f}")
@@ -219,9 +242,9 @@ print(f"Target LRA Objetivo: {TARGET_LRA:.4f}")
 
 
 
-# =============================================================================
-# PASO 4: VALIDACIÓN REGULATORIA (RELIABILITY DIAGRAM)
-# =============================================================================
+from scipy.optimize import minimize_scalar
+from sklearn.calibration import calibration_curve
+
 prob_true, prob_pred = calibration_curve(y, df['pd_12m_calibrated'], n_bins = 10, strategy= 'quantile')
 
 
@@ -234,3 +257,5 @@ plt.title('Calibration Plot - IFRS 9')
 plt.legend()
 plt.grid(True)
 plt.show()
+
+
