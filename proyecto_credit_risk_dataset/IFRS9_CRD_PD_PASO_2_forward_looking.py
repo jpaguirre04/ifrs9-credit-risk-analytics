@@ -34,7 +34,7 @@ escenarios = pd.DataFrame({
 # 2. Función de ajuste por sensibilidad / elasticidad macroeconómica
 
 
-def ajustar_pd(pd_ttc, desemplo_esc, desempleo_base= 0.8, elasticidad= 0.15):
+def ajustar_pd(pd_ttc, desemplo_esc, desempleo_base= 8.0, elasticidad= 0.15):
     """Ajusta la PD TTC mediante un factor de escala según el escenario macroeconómico.
 
     - elasticidad: Cambio % en la PD por cada punto de variación en el desempleo.
@@ -51,6 +51,7 @@ for esc in escenarios['escenario']:
      df[f'pd_12m_fl_{esc.lower()}'] = ajustar_pd(df['pd_12m_ttc'], desempleo_val)
 
 
+
 # 4. PD Final Forward-Looking Ponderada por Probabilidad de Ocurrencia
 # de los Escenarios (MÉTRICA FINAL NIIF 9)
 
@@ -59,3 +60,4 @@ for i, row in escenarios.iterrows():
     # print(i, row)
     esc_name = row['escenario'].lower()
     df['pd_12m_fl'] += row['prob'] * df[f'pd_12m_fl_{esc_name}']
+
